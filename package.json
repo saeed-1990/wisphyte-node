@@ -1,8 +1,11 @@
 {
-  "name": "wisphyte-node",
+  "name": "wisphyte-xray-reality",
   "version": "1.0.0",
-  "main": "index.js",
+  "private": true,
   "scripts": {
     "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
