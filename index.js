@@ -1,108 +1,131 @@
 const fs = require("fs");
 const path = require("path");
 const https = require("https");
+const crypto = require("crypto");
 const { spawn, execFileSync } = require("child_process");
 
-const PORT = Number(process.env.PORT || 10903);
+const PORT = Number(process.env.XRAY_PORT || 10903);
+
 const UUID =
   process.env.VLESS_UUID ||
   "de04add9-5c68-8bab-950c-08cd5320df18";
 
 const REALITY_DEST =
-  process.env.REALITY_DEST || "www.microsoft.com:443";
+  process.env.REALITY_DEST ||
+  "www.microsoft.com:443";
 
 const REALITY_SNI =
-  process.env.REALITY_SNI || "www.microsoft.com";
+  process.env.REALITY_SNI ||
+  "www.microsoft.com";
 
-const DIR = path.join(__dirname, "runtime");
-const XRAY = path.join(DIR, "xray");
-const ZIP = path.join(DIR, "xray.zip");
-const CONFIG = path.join(__dirname, "config.json");
+const ROOT = __dirname;
+const RUNTIME = path.join(ROOT, "runtime");
+const XRAY = path.join(RUNTIME, "xray");
+const ZIP = path.join(RUNTIME, "xray.zip");
+const CONFIG = path.join(RUNTIME, "config.json");
+const KEYS = path.join(RUNTIME, "reality.json");
 
-fs.mkdirSync(DIR, { recursive: true });
+fs.mkdirSync(RUNTIME, { recursive: true });
 
-function run(cmd, args, options = {}) {
-  console.log("+", cmd, ...args);
-  execFileSync(cmd, args, {
-    stdio: "inherit",
-    ...options
-  });
-}
-
-function download(url, output) {
+function download(url, destination) {
   return new Promise((resolve, reject) => {
-    const get = u => {
-      https.get(u, {
-        headers: {
-          "User-Agent": "wisphyte-xray"
-        }
-      }, res => {
-        if (
-          res.statusCode >= 300 &&
-          res.statusCode < 400 &&
-          res.headers.location
-        ) {
-          res.resume();
-          return get(new URL(res.headers.location, u).toString());
-        }
+    const request = (target) => {
+      https
+        .get(
+          target,
+          {
+            headers: {
+              "User-Agent": "wisphyte-xray"
+            }
+          },
+          (res) => {
+            if (
+              res.statusCode >= 300 &&
+              res.statusCode < 400 &&
+              res.headers.location
+            ) {
+              res.resume();
 
-        if (res.statusCode !== 200) {
-          res.resume();
-          return reject(
-            new Error(`Download failed: HTTP ${res.statusCode}`)
-          );
-        }
+              return request(
+                new URL(res.headers.location, target).toString()
+              );
+            }
 
-        const file = fs.createWriteStream(output);
+            if (res.statusCode !== 200) {
+              res.resume();
 
-        res.pipe(file);
+              return reject(
+                new Error(
+                  `Download failed: HTTP ${res.statusCode}`
+                )
+              );
+            }
 
-        file.on("finish", () => {
-          file.close(resolve);
-        });
-      }).on("error", reject);
+            const file = fs.createWriteStream(destination);
+
+            res.pipe(file);
+
+            file.on("finish", () => {
+              file.close(resolve);
+            });
+
+            file.on("error", reject);
+          }
+        )
+        .on("error", reject);
     };
 
-    get(url);
+    request(url);
   });
 }
 
 async function installXray() {
-  if (fs.existsSync(XRAY)) return;
-
-  const arch = process.arch;
+  if (fs.existsSync(XRAY)) {
+    fs.chmodSync(XRAY, 0o755);
+    return;
+  }
 
   let asset;
 
-  if (arch === "x64") {
+  if (process.arch === "x64") {
     asset = "Xray-linux-64.zip";
-  } else if (arch === "arm64") {
+  } else if (process.arch === "arm64") {
     asset = "Xray-linux-arm64-v8a.zip";
   } else {
-    throw new Error(`Unsupported architecture: ${arch}`);
+    throw new Error(
+      `Unsupported architecture: ${process.arch}`
+    );
   }
 
   const url =
     `https://github.com/XTLS/Xray-core/releases/latest/download/${asset}`;
 
-  console.log("Downloading Xray:", url);
+  console.log(`Downloading ${url}`);
 
   await download(url, ZIP);
 
-  run("unzip", ["-o", ZIP, "-d", DIR]);
+  execFileSync(
+    "unzip",
+    ["-o", ZIP, "-d", RUNTIME],
+    { stdio: "inherit" }
+  );
 
   fs.chmodSync(XRAY, 0o755);
   fs.rmSync(ZIP, { force: true });
 }
 
-function generateKeys() {
+function getRealityKeys() {
+  if (fs.existsSync(KEYS)) {
+    return JSON.parse(
+      fs.readFileSync(KEYS, "utf8")
+    );
+  }
+
   const output = execFileSync(
     XRAY,
     ["x25519"],
     { encoding: "utf8" }
   );
-
-  console.log(output);
 
   const privateKey =
     output.match(/PrivateKey:\s*(\S+)/i)?.[1] ||
@@ -115,32 +138,25 @@ function generateKeys() {
 
   if (!privateKey || !publicKey) {
     throw new Error(
-      "Could not parse x25519 output:\n" + output
+      `Could not parse Xray x25519 output:\n${output}`
     );
   }
 
-  return { privateKey, publicKey };
-}
-
-function randomShortId() {
-  return require("crypto")
-    .randomBytes(8)
-    .toString("hex");
-}
-
-async function main() {
-  await installXray();
-
-  console.log("\n=== XRAY VERSION ===");
-  run(XRAY, ["version"]);
-
-  const {
+  const data = {
     privateKey,
-    publicKey
-  } = generateKeys();
+    publicKey,
+    shortId: crypto.randomBytes(8).toString("hex")
+  };
 
-  const shortId = randomShortId();
+  fs.writeFileSync(
+    KEYS,
+    JSON.stringify(data, null, 2)
+  );
 
+  return data;
+}
+
+function createConfig(keys) {
   const config = {
     log: {
       loglevel: "info"
@@ -159,28 +175,27 @@ async function main() {
               flow: "xtls-rprx-vision"
             }
           ],
+
           decryption: "none"
         },
 
         streamSettings: {
           network: "raw",
-
           security: "reality",
 
           realitySettings: {
             show: false,
             dest: REALITY_DEST,
-
             xver: 0,
 
             serverNames: [
               REALITY_SNI
             ],
 
-            privateKey: privateKey,
+            privateKey: keys.privateKey,
 
             shortIds: [
-              shortId
+              keys.shortId
             ]
           }
         }
@@ -199,66 +214,59 @@ async function main() {
     CONFIG,
     JSON.stringify(config, null, 2)
   );
+}
+
+async function main() {
+  await installXray();
+
+  console.log(
+    execFileSync(
+      XRAY,
+      ["version"],
+      { encoding: "utf8" }
+    )
+  );
+
+  const keys = getRealityKeys();
+
+  createConfig(keys);
 
   console.log(`
-========================================
-REALITY CLIENT PARAMETERS
-========================================
-
-Address:
-78.154.103.43
-
-Port:
-${PORT}
-
-UUID:
-${UUID}
-
-Flow:
-xtls-rprx-vision
-
-Security:
-reality
-
-Network:
-raw / tcp
-
-SNI:
-${REALITY_SNI}
-
-Public Key:
-${publicKey}
-
-Short ID:
-${shortId}
-
-Fingerprint:
-chrome
-
-SpiderX:
-/
-
-========================================
+========== V2RAYN ==========
+Protocol: VLESS
+Address: 78.154.103.43
+Port: ${PORT}
+UUID: ${UUID}
+Encryption: none
+Flow: xtls-rprx-vision
+Network: raw
+Security: reality
+SNI: ${REALITY_SNI}
+Fingerprint: chrome
+PublicKey: ${keys.publicKey}
+ShortID: ${keys.shortId}
+SpiderX: /
+=============================
 `);
 
-  const child = spawn(
+  const xray = spawn(
     XRAY,
-    ["run", "-config", CONFIG],
+    [
+      "run",
+      "-config",
+      CONFIG
+    ],
     {
       stdio: "inherit"
     }
   );
 
-  child.on("exit", (code, signal) => {
-    console.error(
-      `Xray stopped: code=${code}, signal=${signal}`
-    );
-
+  xray.on("exit", (code) => {
     process.exit(code ?? 1);
   });
 }
 
-main().catch(err => {
-  console.error(err);
+main().catch((error) => {
+  console.error(error);
   process.exit(1);
 });
