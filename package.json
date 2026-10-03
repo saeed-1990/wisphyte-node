@@ -1,7 +1,8 @@
 {
   "name": "wispbyte-vless-ws",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
+  "description": "Self-healing VLESS WebSocket gateway for Wispbyte",
   "scripts": {
     "start": "node index.js"
   },
