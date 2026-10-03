@@ -1,53 +1,98 @@
+"use strict";
+
 const fs = require("fs");
 const path = require("path");
 const https = require("https");
+const net = require("net");
 const { spawn, execFileSync } = require("child_process");
-
-const PORT = 10903;
-const UUID = "de04add9-5c68-8bab-950c-08cd5320df18";
 
 const ROOT = __dirname;
 const RUNTIME = path.join(ROOT, "runtime");
+
 const XRAY = path.join(RUNTIME, "xray");
 const ZIP = path.join(RUNTIME, "xray.zip");
 const CONFIG = path.join(RUNTIME, "config.json");
 
-fs.mkdirSync(RUNTIME, { recursive: true });
+const PORT = 10903;
+
+const UUID =
+  process.env.VLESS_UUID ||
+  "de04add9-5c68-8bab-950c-08cd5320df18";
+
+const WS_PATH =
+  process.env.WS_PATH ||
+  "/ws";
+
+const HEALTH_INTERVAL = 30000;
+
+fs.mkdirSync(RUNTIME, {
+  recursive: true
+});
+
+let xray = null;
+let stopping = false;
+
+function log(text) {
+  console.log(
+    `[SUPERVISOR ${new Date().toISOString()}] ${text}`
+  );
+}
 
 function download(url, output) {
   return new Promise((resolve, reject) => {
-    const get = (target) => {
+    const get = target => {
       https.get(
         target,
-        { headers: { "User-Agent": "xray" } },
-        (res) => {
+        {
+          headers: {
+            "User-Agent": "wispbyte-xray"
+          }
+        },
+        res => {
           if (
             res.statusCode >= 300 &&
             res.statusCode < 400 &&
             res.headers.location
           ) {
             res.resume();
+
             return get(
-              new URL(res.headers.location, target).toString()
+              new URL(
+                res.headers.location,
+                target
+              ).toString()
             );
           }
 
           if (res.statusCode !== 200) {
+            res.resume();
+
             return reject(
-              new Error(`Download failed: HTTP ${res.statusCode}`)
+              new Error(
+                `HTTP ${res.statusCode}`
+              )
             );
           }
 
-          const file = fs.createWriteStream(output);
+          const file =
+            fs.createWriteStream(output);
+
           res.pipe(file);
 
-          file.on("finish", () => {
-            file.close(resolve);
-          });
+          file.on(
+            "finish",
+            () => file.close(resolve)
+          );
 
-          file.on("error", reject);
+          file.on(
+            "error",
+            reject
+          );
         }
-      ).on("error", reject);
+      ).on(
+        "error",
+        reject
+      );
     };
 
     get(url);
@@ -56,49 +101,74 @@ function download(url, output) {
 
 async function installXray() {
   if (fs.existsSync(XRAY)) {
-    fs.chmodSync(XRAY, 0o755);
+    fs.chmodSync(
+      XRAY,
+      0o755
+    );
+
     return;
   }
 
   let asset;
 
   if (process.arch === "x64") {
-    asset = "Xray-linux-64.zip";
-  } else if (process.arch === "arm64") {
-    asset = "Xray-linux-arm64-v8a.zip";
+    asset =
+      "Xray-linux-64.zip";
+  } else if (
+    process.arch === "arm64"
+  ) {
+    asset =
+      "Xray-linux-arm64-v8a.zip";
   } else {
     throw new Error(
       `Unsupported architecture: ${process.arch}`
     );
   }
 
-  const url =
-    `https://github.com/XTLS/Xray-core/releases/latest/download/${asset}`;
-
-  console.log("Downloading Xray...");
-
-  await download(url, ZIP);
+  await download(
+    `https://github.com/XTLS/Xray-core/releases/latest/download/${asset}`,
+    ZIP
+  );
 
   execFileSync(
     "unzip",
-    ["-o", ZIP, "-d", RUNTIME],
-    { stdio: "inherit" }
+    [
+      "-o",
+      ZIP,
+      "-d",
+      RUNTIME
+    ],
+    {
+      stdio: "inherit"
+    }
   );
 
-  fs.chmodSync(XRAY, 0o755);
-  fs.rmSync(ZIP, { force: true });
+  fs.chmodSync(
+    XRAY,
+    0o755
+  );
+
+  fs.rmSync(
+    ZIP,
+    {
+      force: true
+    }
+  );
 }
 
-function createConfig() {
+function writeConfig() {
   const config = {
     log: {
-      loglevel: "info"
+      loglevel: "warning"
     },
 
     inbounds: [
       {
+        tag: "vless-ws",
+
         listen: "0.0.0.0",
         port: PORT,
+
         protocol: "vless",
 
         settings: {
@@ -112,12 +182,11 @@ function createConfig() {
         },
 
         streamSettings: {
-          network: "xhttp",
+          network: "ws",
           security: "none",
 
-          xhttpSettings: {
-            path: "/xhttp/",
-            mode: "packet-up"
+          wsSettings: {
+            path: WS_PATH
           }
         }
       }
@@ -125,68 +194,189 @@ function createConfig() {
 
     outbounds: [
       {
-        protocol: "freedom",
-        tag: "direct"
+        tag: "direct",
+        protocol: "freedom"
       }
     ]
   };
 
   fs.writeFileSync(
     CONFIG,
-    JSON.stringify(config, null, 2)
+    JSON.stringify(
+      config,
+      null,
+      2
+    )
+  );
+}
+
+function validate() {
+  execFileSync(
+    XRAY,
+    [
+      "run",
+      "-test",
+      "-config",
+      CONFIG
+    ],
+    {
+      stdio: "inherit"
+    }
+  );
+}
+
+function startXray() {
+  log(
+    "Starting Xray..."
+  );
+
+  xray = spawn(
+    XRAY,
+    [
+      "run",
+      "-config",
+      CONFIG
+    ],
+    {
+      stdio: "inherit"
+    }
+  );
+
+  xray.on(
+    "exit",
+    (code, signal) => {
+      log(
+        `Xray exited ${code}/${signal}`
+      );
+
+      xray = null;
+
+      if (!stopping) {
+        setTimeout(
+          startXray,
+          3000
+        );
+      }
+    }
+  );
+}
+
+function healthCheck() {
+  if (
+    !xray ||
+    xray.exitCode !== null
+  ) {
+    log(
+      "HEALTH FAIL: process down"
+    );
+
+    return;
+  }
+
+  const socket =
+    net.createConnection({
+      host: "127.0.0.1",
+      port: PORT
+    });
+
+  socket.setTimeout(3000);
+
+  socket.on(
+    "connect",
+    () => {
+      log(
+        `HEALTH OK: TCP ${PORT}`
+      );
+
+      socket.destroy();
+    }
+  );
+
+  socket.on(
+    "timeout",
+    () => {
+      log(
+        "HEALTH FAIL: timeout"
+      );
+
+      socket.destroy();
+    }
+  );
+
+  socket.on(
+    "error",
+    () => {
+      log(
+        "HEALTH FAIL: listener"
+      );
+    }
   );
 }
 
 async function main() {
   await installXray();
 
-  createConfig();
+  writeConfig();
+
+  validate();
 
   console.log(`
-=================================
-WISPBYTE XHTTP
-=================================
+========================================
+WISPBYTE VLESS WEBSOCKET
+========================================
 
-Address:
+Domain:
 project-s.wispbyte.app
 
-Port:
+Public Port:
 443
 
 UUID:
 ${UUID}
 
-Network:
-xhttp
+Protocol:
+VLESS
 
-Mode:
-packet-up
+Transport:
+WebSocket
 
 Path:
-/xhttp/
+${WS_PATH}
 
 TLS:
-tls
+YES - terminated by Wispbyte/Cloudflare
 
-SNI:
-project-s.wispbyte.app
+Origin TLS:
+NONE
 
-=================================
+========================================
 `);
 
-  const xray = spawn(
-    XRAY,
-    ["run", "-config", CONFIG],
-    { stdio: "inherit" }
-  );
+  startXray();
 
-  xray.on("exit", (code) => {
-    console.log(`Xray exited: ${code}`);
-    process.exit(code ?? 1);
-  });
+  setInterval(
+    healthCheck,
+    HEALTH_INTERVAL
+  );
 }
 
-main().catch((error) => {
+process.on(
+  "SIGTERM",
+  () => {
+    stopping = true;
+
+    if (xray) {
+      xray.kill("SIGTERM");
+    }
+
+    setTimeout(
+      () => process.exit(0),
+      3000
+    );
+  }
+);
+
+main().catch(error => {
   console.error(error);
   process.exit(1);
 });
